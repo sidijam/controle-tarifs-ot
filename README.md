@@ -8,4 +8,4 @@ Application de contrôle mensuel des nouveaux tarifs (feuilles CB et FH) par rap
 - Décisions et historique sont conservés dans le navigateur de chaque poste.
 - Exports : classeur Excel mis en forme et rapport PowerPoint.
 
-Règle de contrôle : montant facturé attendu = REDEVENCE_FORMULE − DISCOUNT, à comparer à la REDEVANCE facturée. Les refontes (upgrade avec baisse de tarif, discount à 0, ancienne redevance supérieure à la formule) sont conformes.
+Règle de contrôle : montant facturé attendu = REDEVENCE_FORMULE − DISCOUNT, à comparer à la REDEVANCE facturée. Les refontes (upgrade avec baisse de tarif, discount à 0, ancienne redevance supérieure à la formule) sont conformes. Une ligne dont la dernière colonne (commentaire) contient « corrigé » est considérée conforme.

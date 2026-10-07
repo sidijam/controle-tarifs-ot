@@ -283,6 +283,7 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--fg)}
           <div class="card rule"><h3>Base de calcul</h3><p><code>REDEVENCE_FORMULE</code> (colonne C) des feuilles CB et FH.</p></div>
           <div class="card rule"><h3>Montant facturé attendu</h3><p><code>REDEVENCE_FORMULE − DISCOUNT</code>. Un discount positif est déduit, un discount négatif est ajouté.</p></div>
           <div class="card rule"><h3>Cas des refontes</h3><p>Upgrade avec hausse de débit et baisse de tarif : conforme si <code>DISCOUNT = 0</code> et <code>ANCIENNE_REDEVANCE &gt; REDEVENCE_FORMULE</code>.</p></div>
+          <div class="card rule"><h3>Lignes corrigées</h3><p>Si la dernière colonne (commentaire) d'une ligne CB/FH contient « corrigé », l'anomalie ou la vérification est levée et la ligne est conforme.</p></div>
           <div class="card rule"><h3>Contrôle C3</h3><p>Le montant attendu doit être égal à la <code>REDEVANCE</code> facturée (colonne B).</p></div>
         </div>
         <div class="tablebox"><table><thead><tr><th>N°</th><th>Contrôle</th><th>Critère</th><th>Effet sur le statut</th></tr></thead><tbody>
@@ -334,7 +335,10 @@ function parseWorkbook(wb){
     const c={code:pick(hh,["CODE"]),red:pick(hh,["REDEVANCE"]),rf:pick(hh,["REDEVENCE_FORMULE","REDEVANCE_FORMULE"]),fo:pick(hh,["FORMULE"]),afo:pick(hh,["ANCIENNE_FORMULE"]),ar:pick(hh,["ANCIENNE_REDEVANCE"]),di:pick(hh,["DISCOUNT"]),mt:pick(hh,["MONTANT_HT"])};
     const need=["code","red","rf","di","ar"].filter(k=>c[k]<0);
     if(need.length) throw new Error("Feuille "+s+" : colonnes manquantes ("+need.join(", ").replace("red","REDEVANCE").replace("rf","REDEVENCE_FORMULE").replace("di","DISCOUNT").replace("ar","ANCIENNE_REDEVANCE").replace("code","CODE")+").");
-    let note=hh.findIndex((x,i)=>i>c.mt&&c.mt>=0&&(x==null||String(x).trim()==="")); if(note<0) note=-1;
+    /* Colonne commentaire : en-tête « Commentaire » si présent, sinon dernière colonne de la feuille */
+    let note=pick(hh,["COMMENTAIRE","COMMENTAIRES","COMMENTAIRE AGENT","OBSERVATION","OBSERVATIONS"]);
+    if(note<0){ const w=Math.max(hh.length,...rr.slice(0,500).map(x=>x?x.length:0)); note=w-1; }
+    if([c.code,c.red,c.rf,c.di,c.ar,c.fo,c.afo,c.mt].includes(note)) note=-1;
     return rr.slice(1).filter(x=>x&&txt(x[c.code])).map(x=>({CODE:txt(x[c.code]),REDEVANCE:x[c.red],REDEVENCE_FORMULE:x[c.rf],FORMULE:c.fo>=0?txt(x[c.fo]):null,ANCIENNE_FORMULE:c.afo>=0?txt(x[c.afo]):null,ANCIENNE_REDEVANCE:x[c.ar],DISCOUNT:x[c.di],NOTE:note>=0?txt(x[note]):null}));
   };
   return {ot, CB:lines(cbName), FH:lines(fhName)};
@@ -359,14 +363,19 @@ function control(data){
       refonte=/upgrade/i.test(type)&&sens==="Baisse"&&J===0&&H>I;
       c2=refonte?"ok":((/upgrade/i.test(type)&&sens==="Baisse")||(/downgrade/i.test(type)&&sens==="Hausse"))?"bad":"ok"; }
     const c1=!!o;
-    const statut = !c1||!c3 ? "Anomalie" : c2==="bad" ? "À vérifier" : "Conforme";
+    let statut = !c1||!c3 ? "Anomalie" : c2==="bad" ? "À vérifier" : "Conforme";
+    /* Commentaire « corrigé » saisi par l'agent : le point est levé et la ligne est considérée conforme */
+    const corrige = /corrig/i.test(String(r.NOTE||"").normalize("NFD").replace(/[\u0300-\u036f]/g,""));
+    let statutInitial = null;
+    if(corrige && statut!=="Conforme"){ statutInitial=statut; statut="Conforme"; }
     let why = expl + (c3?" = REDEVANCE facturée ✓.":`, alors que la REDEVANCE facturée est ${fmt(K)} (écart ${fmt(ecart)}).`);
     if(sens) why+=` ${type.replace(/^OT\s*/i,"")||"OT"} : ${fmt(H)} → ${fmt(nouveau)} (${sens.toLowerCase()}).`;
     else why+=" Pas d'ancienne redevance : sens du prix non applicable.";
     if(refonte) why+=" Refonte : hausse de débit avec baisse de tarif (discount 0, ancienne redevance supérieure à la formule) ✓.";
     if(c2==="bad") why+=" Sens du prix contraire au type d'OT"+(J!==0?" (discount non nul : pas une refonte).":".");
     if(!c1) why+=" Aucun OT marqué « OK » pour ce code.";
-    rows.push({sheet:sh,code:r.CODE,ot:o?o["Id Référence"]:null,client:o?o.Client:null,type,ancien:H,nouveau,att,formule:r.FORMULE,ancFormule:r.ANCIENNE_FORMULE,rf:I,discount:J,redevance:K,note:r.NOTE,regle,refonte,c1,c2,c3,ecart,statut,why});
+    if(statutInitial) why+=` Commentaire agent « ${r.NOTE} » : ${statutInitial.toLowerCase()} levée, ligne considérée conforme.`;
+    rows.push({sheet:sh,code:r.CODE,ot:o?o["Id Référence"]:null,client:o?o.Client:null,type,ancien:H,nouveau,att,formule:r.FORMULE,ancFormule:r.ANCIENNE_FORMULE,rf:I,discount:J,redevance:K,note:r.NOTE,regle,refonte,c1,c2,c3,ecart,statut,statutInitial,corrige:!!statutInitial,why});
   }
   const codes=new Set(rows.map(r=>norm(r.code)));
   const missing=data.ot.filter(o=>!codes.has(norm(o["Code CPE"])));
@@ -423,12 +432,12 @@ async function buildExcel(R){
   // Contrôle lignes
   const d=wb.addWorksheet("Contrôle lignes",{properties:{tabColor:{argb:C.dark}}});
   const DEC=(typeof getDecision==="function")?getDecision:null;
-  const H=["Feuille","Code","Réf. OT","Client","Type OT","Ancienne formule","Nouvelle formule","ANCIENNE_REDEVANCE","REDEVENCE_FORMULE","DISCOUNT","REDEVANCE facturée","Montant attendu (FORMULE − DISCOUNT)","Cas de discount","C1 OT existant","C2 Sens du prix","C3 Règle tarifaire","Écart REDEVANCE − attendu (FCFA/mois)","Statut","Analyse","Annotation fichier"].concat(DEC?["Décision","Commentaire"]:[]);
+  const H=["Feuille","Code","Réf. OT","Client","Type OT","Ancienne formule","Nouvelle formule","ANCIENNE_REDEVANCE","REDEVENCE_FORMULE","DISCOUNT","REDEVANCE facturée","Montant attendu (FORMULE − DISCOUNT)","Cas de discount","C1 OT existant","C2 Sens du prix","C3 Règle tarifaire","Écart REDEVANCE − attendu (FCFA/mois)","Statut","Analyse","Commentaire (fichier)","Corrigé par l'agent"].concat(DEC?["Décision","Commentaire"]:[]);
   const order={Anomalie:0,"À vérifier":1,Conforme:2};
   const rows=[...R.rows].sort((a,b)=>order[a.statut]-order[b.statut]);
   table(d,H,rows.map(r=>[r.sheet,r.code,r.ot,r.client,(r.type||"").replace(/^OT\s*/i,""),r.ancFormule,r.formule,r.ancien,r.rf,r.discount,r.redevance,r.att,r.regle,
-    r.c1?"OK":"OT absent",r.c2==="na"?"Non applicable":r.refonte?"OK (refonte)":r.c2==="ok"?"OK":"Écart",r.c3?"OK":"Écart",r.ecart,r.statut,r.why,r.note].concat(DEC?[(DEC(r.code)||{}).status||"",(DEC(r.code)||{}).comment||""]:[])),
-    [8,12,11,30,13,18,20,14,14,13,13,14,16,12,13,12,13,12,70,12,14,40],{num:[8,9,10,11,12,17],status:[14,15,16,18],wrap:[4,19,22],mono:[2],xSplit:2});
+    r.c1?"OK":"OT absent",r.c2==="na"?"Non applicable":r.refonte?"OK (refonte)":r.c2==="ok"?"OK":"Écart",r.c3?"OK":"Écart",r.ecart,r.statut,r.why,r.note,r.corrige?r.statutInitial+" levée":""].concat(DEC?[(DEC(r.code)||{}).status||"",(DEC(r.code)||{}).comment||""]:[])),
+    [8,12,11,30,13,18,20,14,14,13,13,14,16,12,13,12,13,12,70,16,16,14,40],{num:[8,9,10,11,12,17],status:[14,15,16,18],wrap:[4,19,20,23],mono:[2],xSplit:2});
   const n=rows.length+1, L="'Contrôle lignes'";
   // OT sans ligne
   const m=wb.addWorksheet("OT sans ligne",{properties:{tabColor:{argb:C.b}}});
@@ -449,8 +458,8 @@ async function buildExcel(R){
     ["À vérifier (C2 : sens du prix contraire au type d'OT)",{formula:`COUNTIF(${L}!R2:R${n},"À vérifier")`,result:cnt("À vérifier")},"À vérifier"],
     ["Anomalies (C1 OT absent ou C3 règle non respectée)",{formula:`COUNTIF(${L}!R2:R${n},"Anomalie")`,result:cnt("Anomalie")},"Anomalie"],
     ["C4 – OT marqués « OK » sans ligne CB/FH",R.missing.length,R.missing.length?"Anomalie":"Conforme"],
-    ["Écart mensuel cumulé sur la règle tarifaire (FCFA)",{formula:`SUMPRODUCT(ABS(${L}!Q2:Q${n}))`,result:R.rows.reduce((a,r)=>a+Math.abs(r.ecart),0)},null],
-    ["C5 – Formules facturées à des tarifs différents (information)",R.coh.length,null]];
+    ["Écart mensuel cumulé sur la règle tarifaire (FCFA)",{formula:`SUMPRODUCT(ABS(${L}!Q2:Q${n})*(${L}!U2:U${n}=""))`,result:R.rows.reduce((a,r)=>a+(r.corrige?0:Math.abs(r.ecart)),0)},null],
+    ["C5 – Formules facturées à des tarifs différents (information)",R.coh.length,null],["Lignes corrigées par l'agent (commentaire « corrigé »)",R.rows.filter(r=>r.corrige).length,null]];
   let r0=5; s.getRow(r0).values=[null,"Indicateur","Valeur"];
   ["B","C"].forEach(k=>{const x=s.getCell(k+r0);x.font=F({bold:true,color:{argb:"FFFFFFFF"}});x.fill=fill(C.or);x.border=border;});
   kp.forEach(([a,v,sty],i)=>{ const rr=r0+1+i; s.getCell("B"+rr).value=a; s.getCell("C"+rr).value=v;
@@ -466,7 +475,7 @@ async function buildExcel(R){
     s.getRow(r0).height=14*Math.ceil(s.getCell("B"+r0).value.length/58)+4; r0++; }
   r0+=1;
   Object.assign(s.getCell("B"+r0),{value:"Règles appliquées",font:F({size:12,bold:true,color:{argb:C.or}})}); r0++;
-  for(const t of ["Base de calcul : REDEVENCE_FORMULE (colonne C), pour les feuilles CB et FH.","Montant facturé attendu = REDEVENCE_FORMULE − DISCOUNT : un discount positif est déduit, un discount négatif est ajouté.","Le montant attendu doit être égal à la REDEVANCE facturée (colonne B).","Refonte : un upgrade avec baisse de tarif est conforme si le discount est à 0 et l'ancienne redevance supérieure à la formule.","Contrôles : C1 OT existant · C2 sens du prix · C3 règle tarifaire · C4 exhaustivité · C5 cohérence des prix. Hors périmètre : technologie, date d'effet, montant HT."]){
+  for(const t of ["Base de calcul : REDEVENCE_FORMULE (colonne C), pour les feuilles CB et FH.","Montant facturé attendu = REDEVENCE_FORMULE − DISCOUNT : un discount positif est déduit, un discount négatif est ajouté.","Le montant attendu doit être égal à la REDEVANCE facturée (colonne B).","Commentaire « corrigé » dans la dernière colonne de CB/FH : l'anomalie ou la vérification est levée et la ligne est considérée conforme.","Refonte : un upgrade avec baisse de tarif est conforme si le discount est à 0 et l'ancienne redevance supérieure à la formule.","Contrôles : C1 OT existant · C2 sens du prix · C3 règle tarifaire · C4 exhaustivité · C5 cohérence des prix. Hors périmètre : technologie, date d'effet, montant HT."]){
     s.getCell("B"+r0).value=t; s.getCell("B"+r0).font=F({color:{argb:C.muted}}); s.mergeCells("B"+r0+":C"+r0); s.getCell("B"+r0).alignment={wrapText:true,vertical:"top"}; s.getRow(r0).height=14*Math.ceil(t.length/58)+4; r0++; }
   return new Blob([await wb.xlsx.writeBuffer()],{type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"});
 }
@@ -506,7 +515,7 @@ async function buildPpt(R){
   s.addChart(pres.charts.BAR,[{name:"Lignes",labels:["Discount positif (déduit)","Sans discount","Discount négatif (ajouté)"],values:[pos,nul,neg]}],
     {x:0.5,y:2.6,w:5.6,h:2.55,barDir:"bar",chartColors:[K.or],showValue:true,dataLabelFontSize:10,dataLabelColor:K.dark,catAxisLabelFontSize:10,catAxisLabelColor:K.muted,
      valAxisHidden:true,valGridLine:{style:"none"},catGridLine:{style:"none"},showLegend:false,showTitle:true,title:"Lignes par cas de discount",titleFontSize:12,titleColor:K.dark});
-  const ec=R.rows.reduce((a,r)=>a+Math.abs(r.ecart),0);
+  const ec=R.rows.reduce((a,r)=>a+(r.corrige?0:Math.abs(r.ecart)),0);
   [[R.missing.length,"OT marqués sans ligne CB/FH",R.missing.length?K.b:K.ok],[fmt(ec),"FCFA / mois d'écart sur la règle",ec?K.b:K.ok],[R.coh.length,"formules à tarifs différents (info)",K.muted]].forEach((k,i)=>{const y=2.75+i*0.78;
     s.addShape(pres.shapes.ROUNDED_RECTANGLE,{x:6.4,y,w:3.1,h:0.66,fill:{color:K.light},line:{color:K.light},rectRadius:0.06});
     s.addText(String(k[0]),box({x:6.55,y,w:1.25,h:0.66,fontSize:20,bold:true,color:k[2],valign:"middle"}));
@@ -604,11 +613,11 @@ function renderAll(){
   $("#title").textContent="Contrôle des nouveaux tarifs · "+cap(period());
   $("#meta").innerHTML=(state.example?'<span class="tag ex">Exemple</span>':'<span class="tag">Fichier chargé</span>')+`<span>${esc(state.label)}</span><span>${R.otCount} OT marqués « OK »</span>`;
   const rate=R.rows.length?Math.round(100*cnt("Conforme")/R.rows.length):0;
-  const ecart=R.rows.reduce((a,r)=>a+Math.abs(r.ecart),0);
+  const ecart=R.rows.reduce((a,r)=>a+(r.corrige?0:Math.abs(r.ecart)),0);
   $("#kpis").innerHTML=[
     ["","Lignes contrôlées",R.rows.length,"CB "+R.rows.filter(r=>r.sheet==="CB").length+" · FH "+R.rows.filter(r=>r.sheet==="FH").length],
     ["ok","Conformes",cnt("Conforme"),rate+" % des lignes"],["warn","À vérifier",cnt("À vérifier"),"Sens du prix (C2)"],["bad","Anomalies",cnt("Anomalie"),"OT absent ou règle (C1, C3)"],
-    [R.missing.length?"bad":"ok","OT sans ligne",R.missing.length,"Exhaustivité (C4)"],[ecart?"bad":"ok","Écart de règle",fmt(ecart),"FCFA par mois"],["","Refontes",R.rows.filter(r=>r.refonte).length,"Upgrade avec baisse de tarif"]
+    [R.missing.length?"bad":"ok","OT sans ligne",R.missing.length,"Exhaustivité (C4)"],[ecart?"bad":"ok","Écart de règle",fmt(ecart),"FCFA par mois"],["","Refontes",R.rows.filter(r=>r.refonte).length,"Upgrade avec baisse de tarif"],["ok","Corrigées",R.rows.filter(r=>r.corrige).length,"Commentaire « corrigé » de l'agent"]
   ].map(([c,l,v,d])=>`<div class="kpi ${c}"><span class="l">${l}</span><span class="v">${v}</span><span class="d">${d}</span></div>`).join("");
   // donut
   const parts=[["Conforme",cnt("Conforme"),"var(--ok)"],["À vérifier",cnt("À vérifier"),"var(--warn)"],["Anomalie",cnt("Anomalie"),"var(--bad)"]];
@@ -636,17 +645,17 @@ function renderLines(){
   const n=s=>s==="Tous"?R.rows.length:R.rows.filter(r=>r.statut===s).length;
   chips("#fStatus",["Tous","Anomalie","À vérifier","Conforme"],state.fStatus,"fStatus",n);
   chips("#fSheet",["Toutes","CB","FH"],state.fSheet,"fSheet");
-  chips("#fCase",["Tous","Positif","Sans","Négatif","Refonte"],state.fCase,"fCase");
-  document.querySelectorAll('#fCase .chip').forEach(b=>{ if(b.dataset.v!=="Tous") b.textContent=b.dataset.v==="Sans"?"Sans discount":b.dataset.v==="Refonte"?"Refontes":"Discount "+b.dataset.v.toLowerCase(); });
+  chips("#fCase",["Tous","Positif","Sans","Négatif","Refonte","Corrigé"],state.fCase,"fCase");
+  document.querySelectorAll('#fCase .chip').forEach(b=>{ if(b.dataset.v!=="Tous") b.textContent=b.dataset.v==="Sans"?"Sans discount":b.dataset.v==="Refonte"?"Refontes":b.dataset.v==="Corrigé"?"Corrigées":"Discount "+b.dataset.v.toLowerCase(); });
   const q=state.q.trim().toUpperCase(); const order={Anomalie:0,"À vérifier":1,Conforme:2};
-  let list=R.rows.filter(r=>(state.fStatus==="Tous"||r.statut===state.fStatus)&&(state.fSheet==="Toutes"||r.sheet===state.fSheet)&&(state.fCase==="Tous"||(state.fCase==="Refonte"?r.refonte:caseOf(r)===state.fCase))&&(!q||[r.code,r.client,r.formule].join(" ").toUpperCase().includes(q)));
+  let list=R.rows.filter(r=>(state.fStatus==="Tous"||r.statut===state.fStatus)&&(state.fSheet==="Toutes"||r.sheet===state.fSheet)&&(state.fCase==="Tous"||(state.fCase==="Refonte"?r.refonte:state.fCase==="Corrigé"?r.corrige:caseOf(r)===state.fCase))&&(!q||[r.code,r.client,r.formule].join(" ").toUpperCase().includes(q)));
   const s=state.sort; list.sort((a,b)=>{ if(!s) return order[a.statut]-order[b.statut]; let x=a[s.k],y=b[s.k]; if(s.k==="statut"){x=order[x];y=order[y];} if(x==null) return 1; if(y==null) return -1; return (x>y?1:x<y?-1:0)*s.d; });
   const ck=(l,v)=>`<span class="pill ${v}">${l}</span>`;
   $("#rows").innerHTML=list.length?list.map(r=>{ const d=getDecision(r.code); return `<tr tabindex="0" data-code="${esc(r.code)}">
     <td class="code">${esc(r.code)}</td><td>${r.sheet}</td><td class="mono">${esc(r.ot||"—")}</td><td>${esc(r.client||"—")}</td><td>${esc((r.type||"—").replace(/^OT\s*/i,""))}</td>
     <td class="mono" style="font-size:12.5px">${esc(r.formule||"—")}</td><td class="num">${fmt(r.rf)}</td><td class="num">${fmt(r.discount)}</td><td class="num">${fmt(r.redevance)}</td><td class="num">${fmt(r.ancien)}</td>
     <td><div class="checks">${ck("C1",r.c1?"ok":"bad")}${ck("C2",r.c2==="na"?"na":r.c2)}${ck("C3",r.c3?"ok":"bad")}</div></td>
-    <td><span class="pill ${cls[r.statut]}">${r.statut}</span>${r.refonte?' <span class="pill info">Refonte</span>':""}</td><td>${d&&d.status?`<span class="pill ${decCls[d.status]||"na"}">${esc(d.status)}</span>`:'<span class="sub">—</span>'}</td></tr>`; }).join("")
+    <td><span class="pill ${cls[r.statut]}">${r.statut}</span>${r.refonte?' <span class="pill info">Refonte</span>':""}${r.corrige?' <span class="pill ok">Corrigé</span>':""}</td><td>${d&&d.status?`<span class="pill ${decCls[d.status]||"na"}">${esc(d.status)}</span>`:'<span class="sub">—</span>'}</td></tr>`; }).join("")
     :`<tr><td colspan="13" class="empty">Aucune ligne ne correspond aux filtres.</td></tr>`;
 }
 function renderHist(){
@@ -682,7 +691,7 @@ function openDrawer(code){
       ${ckRow("C2",r.c2==="na"?"na":r.c2==="ok",r.ancien==null?"Pas d'ancienne redevance : non applicable":`${esc((r.type||"").replace(/^OT\s*/i,""))} : ${fmt(r.ancien)} → ${fmt(r.nouveau)}${r.refonte?" : refonte (hausse de débit, baisse de tarif, discount 0)":r.c2==="bad"?" (sens contraire au type d'OT)":""}`)}
       ${ckRow("C3",r.c3,r.c3?"Le montant attendu est égal à la REDEVANCE facturée":"Le montant attendu diffère de la REDEVANCE facturée")}
     </div>
-    <dl class="kv"><dt>Type d'OT</dt><dd>${esc(r.type||"—")}</dd><dt>Ancienne formule</dt><dd class="mono">${esc(r.ancFormule||"—")}</dd><dt>Nouvelle formule</dt><dd class="mono">${esc(r.formule||"—")}</dd><dt>Ancienne redevance</dt><dd class="mono">${fmt(r.ancien)}</dd><dt>Annotation fichier</dt><dd>${esc(r.note||"—")}</dd></dl>
+    <dl class="kv"><dt>Type d'OT</dt><dd>${esc(r.type||"—")}</dd><dt>Ancienne formule</dt><dd class="mono">${esc(r.ancFormule||"—")}</dd><dt>Nouvelle formule</dt><dd class="mono">${esc(r.formule||"—")}</dd><dt>Ancienne redevance</dt><dd class="mono">${fmt(r.ancien)}</dd><dt>Commentaire (fichier)</dt><dd>${esc(r.note||"—")}</dd>${r.corrige?`<dt>Correction</dt><dd><span class="pill ok">Corrigé</span> ${esc(r.statutInitial)} levée par l'agent</dd>`:""}</dl>
     <div class="decision"><h2>Décision</h2>
       <div class="seg" id="segDec">${opts.map(o=>`<button type="button" class="chip" aria-pressed="${d.status===o}" data-dec="${o}">${o}</button>`).join("")}</div>
       <textarea id="decCom" placeholder="Commentaire (ex. remise validée par le commercial, bon de commande n°…)">${esc(d.comment||"")}</textarea>
